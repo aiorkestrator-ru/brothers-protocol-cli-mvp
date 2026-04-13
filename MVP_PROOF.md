@@ -24,11 +24,13 @@ ok 3 - Auto mode: mock provider creates report from AI response
 ok 4 - AI setup defaults + sanitize + retry backoff in auto mode
 # Subtest: Relay strict mode blocks warnings
 ok 5 - Relay strict mode blocks warnings
+# Subtest: Relay strict JSON is JSON-only and does not issue baton
+ok 6 - Relay strict JSON is JSON-only and does not issue baton
 # Subtest: Prompt preview + dry-run + ai test command
-ok 6 - Prompt preview + dry-run + ai test command
-1..6
-# tests 6
-# pass 6
+ok 7 - Prompt preview + dry-run + ai test command
+1..7
+# tests 7
+# pass 7
 # fail 0
 ```
 

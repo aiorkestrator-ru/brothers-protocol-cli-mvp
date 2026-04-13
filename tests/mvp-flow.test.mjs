@@ -8,12 +8,16 @@ import { spawnSync } from 'node:child_process';
 const repoRoot = process.cwd();
 const cliPath = path.join(repoRoot, 'dist', 'cli.js');
 
-function run(args, cwd, env = {}) {
-  const result = spawnSync('node', [cliPath, ...args], {
+function runResult(args, cwd, env = {}) {
+  return spawnSync('node', [cliPath, ...args], {
     cwd,
     encoding: 'utf-8',
     env: { ...process.env, ...env },
   });
+}
+
+function run(args, cwd, env = {}) {
+  const result = runResult(args, cwd, env);
 
   if (result.status !== 0) {
     throw new Error(
@@ -26,11 +30,7 @@ function run(args, cwd, env = {}) {
 }
 
 function runFail(args, cwd, env = {}) {
-  const result = spawnSync('node', [cliPath, ...args], {
-    cwd,
-    encoding: 'utf-8',
-    env: { ...process.env, ...env },
-  });
+  const result = runResult(args, cwd, env);
 
   assert.notEqual(result.status, 0, `Expected command to fail: ${args.join(' ')}`);
   return `${result.stdout}\n${result.stderr}`;
@@ -237,6 +237,50 @@ test('Relay strict mode blocks warnings', () => {
   const strictFail = runFail(['relay-check', 'TASK-002', '--strict'], tempRoot);
   assert.match(strictFail, /strict mode failed/i);
   assert.match(strictFail, /tests were not executed/i);
+
+  // Strict mode must not issue a baton if warnings are treated as errors.
+  assert.equal(
+    fs.existsSync(path.join(tempRoot, 'coordination', 'batons', 'BATON-001.json')),
+    false,
+  );
+});
+
+test('Relay strict JSON is JSON-only and does not issue baton', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brothers-strict-json-'));
+
+  run(['init'], tempRoot);
+  run(['task', 'Warning base task'], tempRoot);
+  run(['start', 'TASK-001'], tempRoot);
+  run([
+    'report',
+    'TASK-001',
+    '--done',
+    'Implemented with no tests',
+    '--files',
+    'coordination/tasks/TASK-001.md',
+    '--tests',
+    'Tests were not run',
+    '--next',
+    'Dependent strict task',
+  ], tempRoot);
+  run(['task', 'Dependent strict task', '--depends-on', 'TASK-001'], tempRoot);
+
+  const result = runResult(['relay-check', 'TASK-002', '--strict', '--json'], tempRoot);
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stderr.trim(), '');
+
+  const data = JSON.parse(result.stdout);
+  assert.equal(data.passed, false);
+  assert.equal(data.strict, true);
+  assert.equal(data.taskId, 'TASK-002');
+  assert.equal(Array.isArray(data.warnings), true);
+  assert.equal('batonId' in data, false);
+  assert.equal('batonPath' in data, false);
+
+  assert.equal(
+    fs.existsSync(path.join(tempRoot, 'coordination', 'batons', 'BATON-001.json')),
+    false,
+  );
 });
 
 test('Prompt preview + dry-run + ai test command', () => {
