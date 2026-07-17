@@ -4,1243 +4,48 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 
+import { boolFromMode, splitList, writeText } from './core/fsutil.js';
+import {
+  type Config,
+  coordinationRoot,
+  findProjectRoot,
+  loadConfig,
+  loadOrCreateSecret,
+  saveConfig,
+} from './core/config.js';
+import {
+  type TaskStatus,
+  createTask,
+  detectCycles,
+  normalizeTaskStatus,
+  parseDependencies,
+  readTaskStatus,
+  replaceDependenciesSection,
+  requireTaskContent,
+  updateTaskStatus,
+} from './core/tasks.js';
+import {
+  createReportForTask,
+  getLatestReportFiles,
+  parseAiResponse,
+  parseNextSteps,
+} from './core/reports.js';
+import {
+  type BatonTestRun,
+  checkBatonSignature,
+  issueRelayBaton,
+  loadBaton,
+  runTestCommand,
+  validateRelayCheck,
+  verifyBatonForTask,
+} from './core/relay.js';
+import { buildPrompt } from './core/prompt.js';
+import { detectStack } from './core/stack.js';
+import { setupProject } from './core/init.js';
+import { callAiWithRetry, callClaudeCode } from './providers.js';
+
 const program = new Command();
-const VERSION = '0.6.0';
-
-type TaskStatus = 'CREATED' | 'IN_PROGRESS' | 'COMPLETED' | 'BLOCKED';
-
-type Config = {
-  project: string;
-  version: string;
-  ai_provider: string;
-  ai_model: string;
-  auto_sanitize_prompt: boolean;
-  ai_retries: number;
-  ai_retry_delay_ms: number;
-  coordination_dir: string;
-  auto_commit: boolean;
-  task_prefix: string;
-  report_prefix: string;
-  conventions_file: string;
-  rules_file: string;
-  baton_ttl_hours: number;
-  stack?: string[];         // detected tech stack, e.g. ["nextjs", "typescript", "postgresql"]
-  stack_docs?: string[];    // llms.txt doc URLs for the stack
-  mcp_suggested?: string[]; // recommended MCP server packages
-};
-
-type RelayDependencyValidation = {
-  taskId: string;
-  reportId: string;
-  artifactsChecked: string[];
-  warnings: string[];
-};
-
-type RelayBaton = {
-  id: string;
-  createdAt: string;
-  expiresAt: string;
-  toTask: string;
-  dependencies: RelayDependencyValidation[];
-  checks: string[];
-  passed: boolean;
-};
-
-type ParsedAiReport = {
-  status: TaskStatus;
-  doneItems: string[];
-  changedFiles: string[];
-  testsOutput: string;
-  nextSteps: string[];
-  resultSummary: string;
-};
-
-const DEFAULT_CONFIG: Config = {
-  project: path.basename(process.cwd()),
-  version: '1.0.0',
-  ai_provider: 'manual',
-  ai_model: '',
-  auto_sanitize_prompt: true,
-  ai_retries: 2,
-  ai_retry_delay_ms: 800,
-  coordination_dir: './coordination',
-  auto_commit: false,
-  task_prefix: 'TASK',
-  report_prefix: 'REPORT',
-  conventions_file: './CONVENTIONS.md',
-  rules_file: './AI_RULES.md',
-  baton_ttl_hours: 72,
-};
-
-function ensureDir(dirPath: string): void {
-  fs.mkdirSync(dirPath, { recursive: true });
-}
-
-function readTextIfExists(filePath: string): string {
-  return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
-}
-
-function writeText(filePath: string, content: string): void {
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, content, 'utf-8');
-}
-
-function toAbs(root: string, maybeRelative: string): string {
-  return path.isAbsolute(maybeRelative) ? maybeRelative : path.join(root, maybeRelative);
-}
-
-function nowIso(): string {
-  const now = new Date();
-  return now.toISOString().replace('T', ' ').slice(0, 19);
-}
-
-function splitList(raw: string | undefined, separators: RegExp = /[;,]/): string[] {
-  if (!raw) return [];
-  return raw
-    .split(separators)
-    .map((value) => value.trim())
-    .filter(Boolean);
-}
-
-function boolFromMode(mode: string | undefined, fallback: boolean): boolean {
-  if (!mode || mode === 'auto') return fallback;
-  if (mode === 'on' || mode === 'true' || mode === '1') return true;
-  if (mode === 'off' || mode === 'false' || mode === '0') return false;
-  throw new Error(`Invalid mode: ${mode}. Expected on|off|auto`);
-}
-
-function findProjectRoot(startDir: string): string {
-  let current = path.resolve(startDir);
-  while (true) {
-    if (fs.existsSync(path.join(current, '.brothers-config.json'))) {
-      return current;
-    }
-    const parent = path.dirname(current);
-    if (parent === current) {
-      throw new Error('Project is not initialized. Run: brothers init');
-    }
-    current = parent;
-  }
-}
-
-function loadConfig(root: string): Config {
-  const configPath = path.join(root, '.brothers-config.json');
-  if (!fs.existsSync(configPath)) {
-    throw new Error('Missing .brothers-config.json. Run: brothers init');
-  }
-  const parsed = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as Partial<Config>;
-  return { ...DEFAULT_CONFIG, ...parsed };
-}
-
-function saveConfig(root: string, config: Config): void {
-  writeText(path.join(root, '.brothers-config.json'), `${JSON.stringify(config, null, 2)}\n`);
-}
-
-function coordinationRoot(root: string, config: Config): string {
-  return toAbs(root, config.coordination_dir);
-}
-
-// ─── Stack detection ──────────────────────────────────────────────────────────
-type StackInfo = { stack: string[]; docs: string[]; mcp: string[] };
-
-/** Read prisma/schema.prisma → return provider string (postgresql|sqlite|mysql|...) */
-function detectPrismaProvider(root: string): string | null {
-  for (const p of ['prisma/schema.prisma', 'schema.prisma']) {
-    const full = path.join(root, p);
-    if (!fs.existsSync(full)) continue;
-    const m = fs.readFileSync(full, 'utf-8').match(/provider\s*=\s*"([^"]+)"/);
-    if (m) return m[1].toLowerCase();
-  }
-  return null;
-}
-
-/** Read drizzle.config.* → return dialect string (postgresql|sqlite|mysql) */
-function detectDrizzleDialect(root: string): string | null {
-  for (const c of ['drizzle.config.ts', 'drizzle.config.js', 'drizzle.config.mjs']) {
-    const full = path.join(root, c);
-    if (!fs.existsSync(full)) continue;
-    const src = fs.readFileSync(full, 'utf-8');
-    if (/dialect\s*:\s*['"]postgresql['"]|dialect\s*:\s*['"]pg['"]/.test(src)) return 'postgresql';
-    if (/dialect\s*:\s*['"]sqlite['"]/.test(src)) return 'sqlite';
-    if (/dialect\s*:\s*['"]mysql['"]/.test(src))  return 'mysql';
-  }
-  return null;
-}
-
-function addPostgres(stack: string[], mcp: string[]): void {
-  if (!stack.includes('postgresql')) stack.push('postgresql');
-  if (!mcp.includes('@modelcontextprotocol/server-postgres')) mcp.push('@modelcontextprotocol/server-postgres');
-}
-
-function addSqlite(stack: string[], mcp: string[]): void {
-  if (!stack.includes('sqlite')) stack.push('sqlite');
-  if (!mcp.includes('mcp-server-sqlite')) mcp.push('mcp-server-sqlite');
-}
-
-function detectStack(root: string): StackInfo {
-  const stack: string[] = [];
-  const docs:  string[] = [];
-  // Vibe-coder baseline: filesystem is always useful for AI agents working in a codebase
-  const mcp: string[] = ['@modelcontextprotocol/server-filesystem'];
-
-  // Git repo → GitHub MCP (issue/PR management)
-  if (fs.existsSync(path.join(root, '.git')) || fs.existsSync(path.join(root, '.github'))) {
-    mcp.push('@modelcontextprotocol/server-github');
-  }
-
-  // GitLab (takes priority over GitHub when both present is unusual, but check anyway)
-  if (fs.existsSync(path.join(root, '.gitlab-ci.yml'))) {
-    mcp.push('@modelcontextprotocol/server-gitlab');
-  }
-
-  // Node.js / package.json
-  const pkgPath = path.join(root, 'package.json');
-  if (fs.existsSync(pkgPath)) {
-    stack.push('nodejs');
-    try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
-        dependencies?: Record<string, string>;
-        devDependencies?: Record<string, string>;
-      };
-      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-
-      // Frameworks
-      if (deps['next'])   { stack.push('nextjs');  docs.push('https://nextjs.org/llms.txt'); }
-      if (deps['astro'])  { stack.push('astro');   docs.push('https://docs.astro.build/llms.txt'); }
-      if (deps['vue'])    { stack.push('vue');      docs.push('https://vuejs.org/llms.txt'); }
-      if (deps['react'] && !deps['next'] && !deps['astro']) stack.push('react');
-      if (deps['express'])  stack.push('express');
-      if (deps['fastify'])  stack.push('fastify');
-      if (deps['typescript'] || deps['@types/node']) stack.push('typescript');
-      if (deps['ink']) stack.push('ink-tui');
-
-      // PostgreSQL — only explicit pg drivers
-      if (deps['pg'] || deps['postgres']) addPostgres(stack, mcp);
-
-      // Prisma — check schema for real provider
-      if (deps['@prisma/client']) {
-        stack.push('prisma');
-        const provider = detectPrismaProvider(root);
-        if (provider === 'postgresql') addPostgres(stack, mcp);
-        else if (provider === 'sqlite') addSqlite(stack, mcp);
-        else if (provider === 'mysql')  stack.push('mysql');
-      }
-
-      // Drizzle — check config for real dialect
-      if (deps['drizzle-orm']) {
-        stack.push('drizzle');
-        const dialect = detectDrizzleDialect(root);
-        if (dialect === 'postgresql') addPostgres(stack, mcp);
-        else if (dialect === 'sqlite') addSqlite(stack, mcp);
-        else if (dialect === 'mysql')  stack.push('mysql');
-      }
-
-      // SQLite — explicit drivers
-      if (deps['better-sqlite3'] || deps['sqlite3']) addSqlite(stack, mcp);
-
-      // Browser automation — prefer @playwright/mcp (official, modern)
-      if (deps['@playwright/test'] || deps['playwright']) mcp.push('@playwright/mcp');
-      else if (deps['puppeteer'])                          mcp.push('@modelcontextprotocol/server-puppeteer');
-
-      // AI stack detection (Node.js)
-      // No official MCP servers exist for AI providers yet — suggest memory+search instead
-      const aiDeps = ['openai', 'anthropic', '@anthropic-ai/sdk', '@google/generative-ai',
-                      'langchain', '@langchain/core', 'llamaindex', 'ai', 'ollama'];
-      const hasAiDep = aiDeps.some(d => !!deps[d]);
-      if (hasAiDep) {
-        if (deps['openai'])                          stack.push('openai');
-        if (deps['anthropic'] || deps['@anthropic-ai/sdk']) stack.push('anthropic');
-        if (deps['@google/generative-ai'])           stack.push('gemini');
-        if (deps['langchain'] || deps['@langchain/core']) stack.push('langchain');
-        if (deps['llamaindex'])                      stack.push('llamaindex');
-        if (deps['ai'])                              stack.push('vercel-ai-sdk');
-        if (deps['ollama'])                          stack.push('ollama');
-        // Useful MCPs when building AI solutions
-        if (!mcp.includes('@modelcontextprotocol/server-memory'))
-          mcp.push('@modelcontextprotocol/server-memory');
-        if (!mcp.includes('@modelcontextprotocol/server-brave-search'))
-          mcp.push('@modelcontextprotocol/server-brave-search');
-      }
-
-    } catch { /* malformed package.json */ }
-  }
-
-  // Python
-  const pyFiles = ['pyproject.toml', 'requirements.txt', 'requirements.in'];
-  if (pyFiles.some(f => fs.existsSync(path.join(root, f)))) {
-    stack.push('python');
-    const content = pyFiles
-      .map(f => path.join(root, f))
-      .filter(p => fs.existsSync(p))
-      .map(p => fs.readFileSync(p, 'utf-8'))
-      .join('\n')
-      .toLowerCase();
-    if (content.includes('fastapi')) { stack.push('fastapi'); docs.push('https://fastapi.tiangolo.com/llms.txt'); }
-    if (content.includes('django'))  stack.push('django');
-    if (content.includes('flask'))   stack.push('flask');
-    // PostgreSQL — only explicit pg drivers, not sqlalchemy alone
-    if (content.includes('psycopg2') || content.includes('psycopg') || content.includes('asyncpg')) addPostgres(stack, mcp);
-    // SQLite
-    if (content.includes('aiosqlite') || content.includes('databases[sqlite')) addSqlite(stack, mcp);
-    // Playwright for Python
-    if (content.includes('playwright')) mcp.push('@playwright/mcp');
-    // AI stack detection (Python)
-    const pyAiLibs: Record<string, string> = {
-      'openai':            'openai',
-      'anthropic':         'anthropic',
-      'google-generativeai': 'gemini',
-      'langchain':         'langchain',
-      'llama-index':       'llamaindex',
-      'llama_index':       'llamaindex',
-      'ollama':            'ollama',
-    };
-    let foundAi = false;
-    for (const [lib, label] of Object.entries(pyAiLibs)) {
-      if (content.includes(lib) && !stack.includes(label)) { stack.push(label); foundAi = true; }
-    }
-    if (foundAi) {
-      if (!mcp.includes('@modelcontextprotocol/server-memory'))
-        mcp.push('@modelcontextprotocol/server-memory');
-      if (!mcp.includes('@modelcontextprotocol/server-brave-search'))
-        mcp.push('@modelcontextprotocol/server-brave-search');
-    }
-  }
-
-  // Rust / Go
-  if (fs.existsSync(path.join(root, 'Cargo.toml'))) stack.push('rust');
-  if (fs.existsSync(path.join(root, 'go.mod')))     stack.push('go');
-
-  return {
-    stack: [...new Set(stack)],
-    docs:  [...new Set(docs)],
-    mcp:   [...new Set(mcp)],
-  };
-}
-
-function numericIdsFromFiles(dirPath: string, prefix: string, extension = '.md'): number[] {
-  if (!fs.existsSync(dirPath)) return [];
-  const escapedExt = extension.replace('.', '\\.');
-  const matcher = new RegExp(`^${prefix}-(\\d+)${escapedExt}$`);
-  return fs
-    .readdirSync(dirPath)
-    .map((name) => {
-      const match = name.match(matcher);
-      return match ? Number(match[1]) : null;
-    })
-    .filter((id): id is number => Number.isFinite(id));
-}
-
-function nextEntityId(dirPath: string, prefix: string, extension = '.md'): string {
-  ensureDir(dirPath);
-  // Atomic ID allocation: O_EXCL fails if file already exists, preventing race conditions
-  // when multiple CLI processes run concurrently (e.g. in CI pipelines).
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const ids = numericIdsFromFiles(dirPath, prefix, extension);
-    const next = ids.length === 0 ? 1 : Math.max(...ids) + 1;
-    const candidate = `${prefix}-${String(next).padStart(3, '0')}`;
-    const placeholder = path.join(dirPath, `${candidate}${extension}`);
-    try {
-      // O_CREAT | O_EXCL: creates file only if it does NOT exist (atomic on POSIX)
-      const fd = fs.openSync(placeholder, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY);
-      fs.closeSync(fd);
-      // Placeholder written — caller's writeText() will overwrite with real content
-      return candidate;
-    } catch (e: unknown) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue; // another process claimed this ID
-      throw e;
-    }
-  }
-  throw new Error(`Failed to allocate unique ${prefix} ID after 20 attempts (concurrent writes?)`);
-}
-
-function normalizeTaskStatus(value: string | undefined): TaskStatus {
-  const upper = (value ?? '').toUpperCase();
-  if (upper === 'CREATED' || upper === 'IN_PROGRESS' || upper === 'COMPLETED' || upper === 'BLOCKED') {
-    return upper;
-  }
-  return 'COMPLETED';
-}
-
-function updateTaskStatus(taskPath: string, status: TaskStatus): void {
-  const content = fs.readFileSync(taskPath, 'utf-8');
-  const updated = content.replace(/\*Status:\s*[^*]+\*/g, `*Status: ${status}*`);
-  fs.writeFileSync(taskPath, updated, 'utf-8');
-}
-
-function readTaskStatus(content: string): TaskStatus {
-  const match = content.match(/\*Status:\s*([A-Z_]+)\*/);
-  return normalizeTaskStatus(match?.[1]);
-}
-
-function extractSection(content: string, sectionTitle: string): string {
-  const escaped = sectionTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const matcher = new RegExp(`##\\s+${escaped}([\\s\\S]*?)(\\n##\\s+|$)`, 'i');
-  const match = content.match(matcher);
-  return match?.[1]?.trim() ?? '';
-}
-
-function extractAnySection(content: string, sectionTitles: string[]): string {
-  for (const title of sectionTitles) {
-    const section = extractSection(content, title);
-    if (section) return section;
-  }
-  return '';
-}
-
-function parseChecklistItems(section: string): string[] {
-  if (!section) return [];
-  const lines = section
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const items: string[] = [];
-  for (const line of lines) {
-    const checklist = line.match(/^[-*]\s*(?:✅|\[x\]|\[X\])\s*(.+)$/);
-    const bullet = line.match(/^[-*]\s*(?:\[\s\]|\[x\]|\[X\])?\s*(.+)$/);
-    const numeric = line.match(/^\d+\.\s+(.+)$/);
-    if (checklist) items.push(checklist[1].trim());
-    else if (bullet) items.push(bullet[1].trim());
-    else if (numeric) items.push(numeric[1].trim());
-  }
-
-  return Array.from(new Set(items));
-}
-
-function parseDependencies(taskContent: string): string[] {
-  const section = extractSection(taskContent, 'Dependencies');
-  if (!section) return [];
-
-  const lines = section
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const deps: string[] = [];
-  for (const line of lines) {
-    if (/^none$/i.test(line)) continue;
-    const bullet = line.match(/^[-*]\s*(.+)$/);
-    const value = bullet ? bullet[1].trim() : line;
-    if (/^TASK-\d+$/i.test(value)) deps.push(value.toUpperCase());
-  }
-
-  return Array.from(new Set(deps));
-}
-
-/**
- * DFS cycle detection in the task dependency graph.
- * Returns the cycle path (e.g. ["TASK-001","TASK-003","TASK-001"]) or null if no cycle.
- * Uses a recursion stack (recStack) to distinguish back-edges from cross-edges.
- */
-function detectCycles(
-  startId: string,
-  tasksDir: string,
-  visited: Set<string> = new Set(),
-  recStack: string[] = [],
-): string[] | null {
-  if (recStack.includes(startId)) {
-    // Found a back-edge → cycle. Return path from first occurrence to current.
-    return [...recStack.slice(recStack.indexOf(startId)), startId];
-  }
-  if (visited.has(startId)) return null; // already fully explored, no cycle through here
-  visited.add(startId);
-
-  const taskFile = path.join(tasksDir, `${startId}.md`);
-  if (!fs.existsSync(taskFile)) return null; // task doesn't exist yet, skip
-
-  const content = fs.readFileSync(taskFile, 'utf-8');
-  const deps = parseDependencies(content);
-
-  for (const dep of deps) {
-    const cycle = detectCycles(dep, tasksDir, visited, [...recStack, startId]);
-    if (cycle) return cycle;
-  }
-
-  return null;
-}
-
-function replaceDependenciesSection(taskContent: string, dependencies: string[]): string {
-  const depsBlock = dependencies.length > 0 ? dependencies.map((dep) => `- ${dep}`).join('\n') : 'None';
-  const matcher = /##\s+Dependencies[\s\S]*?(\n##\s+|\n---|$)/i;
-
-  if (matcher.test(taskContent)) {
-    return taskContent.replace(matcher, `## Dependencies\n${depsBlock}\n\n$1`);
-  }
-
-  const marker = '\n## Done Criteria';
-  const insertion = `\n## Dependencies\n${depsBlock}\n`;
-  if (taskContent.includes(marker)) {
-    return taskContent.replace(marker, `${insertion}${marker}`);
-  }
-
-  return `${taskContent.trim()}\n\n## Dependencies\n${depsBlock}\n`;
-}
-
-function renderTaskMarkdown(
-  id: string,
-  title: string,
-  priority: string,
-  assignee: string,
-  details: string,
-  files: string[],
-  dependencies: string[],
-): string {
-  const filesList = files.length > 0 ? files.map((file) => `- ${file}`).join('\n') : 'None';
-  const depsList = dependencies.length > 0 ? dependencies.map((dep) => `- ${dep}`).join('\n') : 'None';
-
-  return `# ${id}: ${title}
-
-## Description
-${title}
-
-## Created
-${nowIso()}
-
-## Assignee
-${assignee}
-
-## Priority
-${priority}
-
-## Details
-${details || '[Fill details]'}
-
-## Dependencies
-${depsList}
-
-## Done Criteria
-- [ ] Code works
-- [ ] Tests pass
-- [ ] Documentation updated
-
-## Files
-${filesList}
-
----
-*Status: CREATED*
-*Next: Run brothers start ${id}*
-`;
-}
-
-function extractTaskTitle(taskContent: string): string {
-  const firstLine = taskContent.split('\n').find((line) => line.startsWith('# '));
-  if (!firstLine) return 'Untitled task';
-  return firstLine.replace(/^#\s+[^:]+:\s*/, '').trim();
-}
-
-function getLatestReportFiles(reportsDir: string, count: number): string[] {
-  if (!fs.existsSync(reportsDir)) return [];
-  const files = fs
-    .readdirSync(reportsDir)
-    .filter((name) => /^REPORT-\d+\.md$/.test(name))
-    .sort((a, b) => a.localeCompare(b));
-  return files.slice(-count).map((name) => path.join(reportsDir, name));
-}
-
-function parseNextSteps(reportContent: string): string[] {
-  const section = extractAnySection(reportContent, ['NEXT STEPS', 'СЛЕДУЮЩИЕ ШАГИ']);
-  return parseChecklistItems(section);
-}
-
-function setupProject(root: string, projectName: string): void {
-  const coordination = path.join(root, 'coordination');
-  ensureDir(path.join(coordination, 'tasks'));
-  ensureDir(path.join(coordination, 'reports'));
-  ensureDir(path.join(coordination, 'templates'));
-  ensureDir(path.join(coordination, 'prompts'));
-  ensureDir(path.join(coordination, 'archive'));
-  ensureDir(path.join(coordination, 'batons'));
-
-  const detected = detectStack(root);
-  const config: Config = {
-    ...DEFAULT_CONFIG,
-    project: projectName,
-    ...(detected.stack.length > 0  && { stack: detected.stack }),
-    ...(detected.docs.length  > 0  && { stack_docs: detected.docs }),
-    ...(detected.mcp.length   > 0  && { mcp_suggested: detected.mcp }),
-  };
-
-  saveConfig(root, config);
-
-  writeText(
-    path.join(coordination, 'templates', 'task-template.md'),
-    `# TASK-{ID}: {TITLE}
-
-## Description
-{DESCRIPTION}
-
-## Created
-{DATE}
-
-## Assignee
-{ASSIGNEE}
-
-## Priority
-{PRIORITY}
-
-## Details
-{DETAILS}
-
-## Dependencies
-{DEPENDENCIES}
-
-## Done Criteria
-- [ ] Code works
-- [ ] Tests pass
-- [ ] Documentation updated
-
-## Files
-{FILES}
-
----
-*Status: CREATED*
-`,
-  );
-
-  writeText(
-    path.join(coordination, 'templates', 'report-template.md'),
-    `# REPORT-{ID}: {TASK_TITLE}
-
-## DATE
-{DATE}
-
-## EXECUTOR
-{EXECUTOR}
-
-## STATUS
-{STATUS}
-
-## TASK
-{TASK_ID}
-
-## WORK DONE
-- ✅ {ITEM_1}
-
-## FILES CHANGED
-- {FILE_1}
-
-## TESTS
-{TEST_OUTPUT}
-
-## RESULT
-{RESULT}
-
-## NEXT STEPS
-- [ ] {NEXT_STEP_1}
-`,
-  );
-
-  writeText(
-    path.join(root, 'README.md'),
-    `# ${projectName}
-
-MVP implementation for Brothers Protocol CLI.
-
-## Quick Start
-
-\`\`\`bash
-npm install
-npm run build
-node dist/cli.js init
-node dist/cli.js task "My first task"
-node dist/cli.js start TASK-001
-node dist/cli.js report TASK-001 --done "Implemented flow" --tests "npm test"
-node dist/cli.js status
-\`\`\`
-`,
-  );
-
-  if (!fs.existsSync(path.join(root, 'AI_RULES.md'))) {
-    writeText(path.join(root, 'AI_RULES.md'), '# AI Rules\n\nAdd project-level AI execution rules here.\n');
-  }
-}
-
-function createTask(
-  root: string,
-  title: string,
-  options: { priority: string; assignee: string; details: string; files: string[]; dependsOn: string[] },
-): { id: string; taskPath: string } {
-  const config = loadConfig(root);
-  const coordination = coordinationRoot(root, config);
-  const tasksDir = path.join(coordination, 'tasks');
-
-  const id = nextEntityId(tasksDir, config.task_prefix);
-
-  // Guard: detect cycles before writing. Since `id` doesn't exist yet,
-  // a cycle would only occur if any existing dep already (transitively) points
-  // back to a task with the same id — practically impossible, but safe to check.
-  for (const dep of options.dependsOn) {
-    const cycle = detectCycles(dep, tasksDir, new Set([id]), [id]);
-    if (cycle) {
-      // Remove the placeholder created by nextEntityId before throwing
-      const placeholder = path.join(tasksDir, `${id}.md`);
-      if (fs.existsSync(placeholder)) fs.unlinkSync(placeholder);
-      throw new Error(`Circular dependency detected: ${cycle.join(' → ')}`);
-    }
-  }
-
-  const taskPath = path.join(tasksDir, `${id}.md`);
-  const content = renderTaskMarkdown(
-    id,
-    title,
-    options.priority,
-    options.assignee,
-    options.details,
-    options.files,
-    options.dependsOn,
-  );
-
-  writeText(taskPath, content);
-  return { id, taskPath };
-}
-
-function getTaskPath(tasksDir: string, taskId: string): string {
-  return path.join(tasksDir, `${taskId}.md`);
-}
-
-function requireTaskContent(tasksDir: string, taskId: string): { taskPath: string; taskContent: string } {
-  const taskPath = getTaskPath(tasksDir, taskId);
-  if (!fs.existsSync(taskPath)) {
-    throw new Error(`Task not found: ${taskId}`);
-  }
-  return { taskPath, taskContent: fs.readFileSync(taskPath, 'utf-8') };
-}
-
-function findLatestReportForTask(
-  reportsDir: string,
-  taskId: string,
-): { reportId: string; reportPath: string; reportContent: string } | null {
-  const files = getLatestReportFiles(reportsDir, Number.MAX_SAFE_INTEGER).reverse();
-
-  for (const reportPath of files) {
-    const content = fs.readFileSync(reportPath, 'utf-8');
-    const section = extractSection(content, 'TASK');
-    const linkedTask = section.split('\n')[0]?.trim();
-    if (linkedTask === taskId) {
-      const reportId = path.basename(reportPath, '.md');
-      return { reportId, reportPath, reportContent: content };
-    }
-  }
-
-  return null;
-}
-
-function parseChangedFiles(reportContent: string): string[] {
-  const section = extractAnySection(reportContent, ['FILES CHANGED', 'ИЗМЕНЁННЫЕ ФАЙЛЫ']);
-  if (!section) return [];
-
-  const lines = section
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const files: string[] = [];
-  for (const line of lines) {
-    const bullet = line.match(/^[-*]\s+(.+)$/);
-    if (!bullet) continue;
-    const candidate = bullet[1].replace(/^`|`$/g, '').replace(/\s+\(.*\)$/, '').trim();
-    if (!candidate || /^not specified$/i.test(candidate)) continue;
-    files.push(candidate);
-  }
-
-  return Array.from(new Set(files));
-}
-
-function validateReportStructure(reportContent: string): string[] {
-  const requiredSections = ['WORK DONE', 'FILES CHANGED', 'TESTS', 'RESULT', 'NEXT STEPS'];
-  const missing: string[] = [];
-
-  for (const section of requiredSections) {
-    if (!extractSection(reportContent, section)) {
-      missing.push(section);
-    }
-  }
-
-  return missing;
-}
-
-function validateRelayCheck(
-  root: string,
-  config: Config,
-  taskId: string,
-): { warnings: string[]; validatedDeps: RelayDependencyValidation[] } {
-  const coordination = coordinationRoot(root, config);
-  const tasksDir = path.join(coordination, 'tasks');
-  const reportsDir = path.join(coordination, 'reports');
-
-  const { taskContent } = requireTaskContent(tasksDir, taskId);
-  const dependencies = parseDependencies(taskContent);
-
-  if (dependencies.length === 0) {
-    throw new Error(`Task ${taskId} has no dependencies. Relay check is not required.`);
-  }
-
-  // Safety net: reject relay-check if someone manually introduced a cycle
-  for (const dep of dependencies) {
-    const cycle = detectCycles(dep, tasksDir, new Set([taskId]), [taskId]);
-    if (cycle) {
-      throw new Error(`Circular dependency detected: ${cycle.join(' → ')}. Fix dependencies before relay-check.`);
-    }
-  }
-
-  const errors: string[] = [];
-  const warnings: string[] = [];
-  const validatedDeps: RelayDependencyValidation[] = [];
-
-  for (const dep of dependencies) {
-    const depTaskPath = getTaskPath(tasksDir, dep);
-    if (!fs.existsSync(depTaskPath)) {
-      errors.push(`${dep}: task file is missing`);
-      continue;
-    }
-
-    const depTaskContent = fs.readFileSync(depTaskPath, 'utf-8');
-    const depStatus = readTaskStatus(depTaskContent);
-    if (depStatus !== 'COMPLETED') {
-      errors.push(`${dep}: status is ${depStatus}, expected COMPLETED`);
-      continue;
-    }
-
-    const report = findLatestReportForTask(reportsDir, dep);
-    if (!report) {
-      errors.push(`${dep}: report not found`);
-      continue;
-    }
-
-    const missingSections = validateReportStructure(report.reportContent);
-    if (missingSections.length > 0) {
-      errors.push(`${dep}: report ${report.reportId} missing sections ${missingSections.join(', ')}`);
-      continue;
-    }
-
-    const changedFiles = parseChangedFiles(report.reportContent);
-    const missingFiles = changedFiles.filter((file) => !fs.existsSync(path.resolve(root, file)));
-    if (missingFiles.length > 0) {
-      errors.push(`${dep}: missing artifacts ${missingFiles.join(', ')}`);
-      continue;
-    }
-
-    const testsSection = extractSection(report.reportContent, 'TESTS');
-    if (/not run|not executed|не запуск/i.test(testsSection)) {
-      warnings.push(`${dep}: tests were not executed according to ${report.reportId}`);
-    }
-
-    validatedDeps.push({
-      taskId: dep,
-      reportId: report.reportId,
-      artifactsChecked: changedFiles,
-      warnings: [],
-    });
-  }
-
-  if (errors.length > 0) {
-    throw new Error(`Relay validation failed:\n- ${errors.join('\n- ')}`);
-  }
-
-  return { warnings, validatedDeps };
-}
-
-function issueRelayBaton(
-  root: string,
-  config: Config,
-  taskId: string,
-  validatedDeps: RelayDependencyValidation[],
-): { baton: RelayBaton; batonPath: string } {
-  const coordination = coordinationRoot(root, config);
-  const batonsDir = path.join(coordination, 'batons');
-
-  ensureDir(batonsDir);
-
-  const batonId = nextEntityId(batonsDir, 'BATON', '.json');
-  const ttlHours = config.baton_ttl_hours ?? 72;
-  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000)
-    .toISOString()
-    .slice(0, 19)
-    .replace('T', ' ');
-  const baton: RelayBaton = {
-    id: batonId,
-    createdAt: nowIso(),
-    expiresAt,
-    toTask: taskId,
-    dependencies: validatedDeps,
-    checks: ['dependencies_completed', 'reports_exist', 'report_sections_valid', 'artifacts_exist'],
-    passed: true,
-  };
-
-  const batonPath = path.join(batonsDir, `${batonId}.json`);
-  writeText(batonPath, `${JSON.stringify(baton, null, 2)}\n`);
-
-  return { baton, batonPath };
-}
-
-function loadBaton(coordination: string, batonId: string): RelayBaton {
-  const batonPath = path.join(coordination, 'batons', `${batonId}.json`);
-  if (!fs.existsSync(batonPath)) {
-    throw new Error(`Baton not found: ${batonId}`);
-  }
-  return JSON.parse(fs.readFileSync(batonPath, 'utf-8')) as RelayBaton;
-}
-
-function verifyBatonForTask(
-  coordination: string,
-  taskId: string,
-  dependencies: string[],
-  batonId: string,
-): RelayBaton {
-  const baton = loadBaton(coordination, batonId);
-
-  if (!baton.passed) throw new Error(`Baton ${batonId} is not passed`);
-  if (baton.expiresAt && new Date(baton.expiresAt) < new Date()) {
-    throw new Error(
-      `Baton ${batonId} expired at ${baton.expiresAt}. Run: brothers relay-check ${taskId} to issue a fresh baton.`,
-    );
-  }
-  if (baton.toTask !== taskId) throw new Error(`Baton ${batonId} is for ${baton.toTask}, not ${taskId}`);
-
-  const batonDeps = baton.dependencies.map((dep) => dep.taskId).sort();
-  const taskDeps = [...dependencies].sort();
-  if (JSON.stringify(batonDeps) !== JSON.stringify(taskDeps)) {
-    throw new Error(`Baton ${batonId} does not match current dependencies for ${taskId}`);
-  }
-
-  return baton;
-}
-
-function createReportForTask(
-  root: string,
-  config: Config,
-  taskId: string,
-  payload: {
-    doneItems: string[];
-    changedFiles: string[];
-    testsOutput: string;
-    nextSteps: string[];
-    executor: string;
-    status: TaskStatus;
-    resultSummary?: string;
-  },
-): { reportId: string; reportPath: string } {
-  const coordination = coordinationRoot(root, config);
-  const tasksDir = path.join(coordination, 'tasks');
-  const reportsDir = path.join(coordination, 'reports');
-
-  const { taskPath, taskContent } = requireTaskContent(tasksDir, taskId);
-  const reportId = nextEntityId(reportsDir, config.report_prefix);
-  const reportPath = path.join(reportsDir, `${reportId}.md`);
-  const title = extractTaskTitle(taskContent);
-
-  const doneItems = payload.doneItems.length > 0
-    ? payload.doneItems.map((item) => `- ✅ ${item}`).join('\n')
-    : '- ✅ Implemented task';
-
-  const changedFiles = payload.changedFiles.length > 0
-    ? payload.changedFiles.map((item) => `- ${item}`).join('\n')
-    : '- Not specified';
-
-  const nextSteps = payload.nextSteps.length > 0
-    ? payload.nextSteps.map((item) => `- [ ] ${item}`).join('\n')
-    : '- [ ] Define next task';
-
-  const report = `# ${reportId}: ${title}
-
-## DATE
-${nowIso()}
-
-## EXECUTOR
-${payload.executor}
-
-## STATUS
-${payload.status}
-
-## TASK
-${taskId}
-
-## WORK DONE
-${doneItems}
-
-## FILES CHANGED
-${changedFiles}
-
-## TESTS
-\`\`\`text
-${payload.testsOutput}
-\`\`\`
-
-## RESULT
-${payload.resultSummary || `Task ${taskId} completed and documented.`}
-
-## NEXT STEPS
-${nextSteps}
-`;
-
-  writeText(reportPath, report);
-  updateTaskStatus(taskPath, payload.status);
-
-  return { reportId, reportPath };
-}
-
-function sanitizePrompt(raw: string): string {
-  const replacements: Array<[RegExp, string]> = [
-    [/ghp_[A-Za-z0-9]{20,}/g, '[REDACTED_GITHUB_TOKEN]'],
-    [/sk-[A-Za-z0-9_-]{16,}/g, '[REDACTED_API_KEY]'],
-    [/AKIA[0-9A-Z]{16}/g, '[REDACTED_AWS_KEY]'],
-    [/AIza[0-9A-Za-z-_]{20,}/g, '[REDACTED_GOOGLE_KEY]'],
-    [/(password\s*[:=]\s*)[^\s\n]+/gi, '$1[REDACTED_PASSWORD]'],
-    [/(token\s*[:=]\s*)[^\s\n]+/gi, '$1[REDACTED_TOKEN]'],
-    [/(api[_-]?key\s*[:=]\s*)[^\s\n]+/gi, '$1[REDACTED_API_KEY]'],
-    [/(authorization\s*:\s*bearer\s+)[^\s\n]+/gi, '$1[REDACTED_BEARER]'],
-  ];
-
-  let sanitized = raw;
-  for (const [pattern, replacement] of replacements) {
-    sanitized = sanitized.replace(pattern, replacement);
-  }
-  return sanitized;
-}
-
-function buildPrompt(
-  root: string,
-  config: Config,
-  taskId: string,
-  taskContent: string,
-): { rawPrompt: string; sanitizedPrompt: string } {
-  const coordination = coordinationRoot(root, config);
-  const rules = readTextIfExists(toAbs(root, config.rules_file));
-  const conventions = readTextIfExists(toAbs(root, config.conventions_file));
-  const latestReports = getLatestReportFiles(path.join(coordination, 'reports'), 3)
-    .map((reportPath) => `\n---\nFile: ${path.basename(reportPath)}\n${fs.readFileSync(reportPath, 'utf-8')}`)
-    .join('\n');
-
-  const stackLine = config.stack?.length
-    ? `STACK: ${config.stack.join(', ')}`
-    : '';
-  const docsBlock = config.stack_docs?.length
-    ? `DOCUMENTATION (fetch these llms.txt for current API reference):\n${config.stack_docs.map(u => `- ${u}`).join('\n')}`
-    : '';
-
-  const rawPrompt = [
-    'CONTEXT: Working with Brothers Protocol',
-    '',
-    stackLine,
-    docsBlock,
-    '',
-    `RULES:\n${rules || '[No AI_RULES.md found]'}`,
-    '',
-    `CONVENTIONS:\n${conventions || '[No CONVENTIONS.md found]'}`,
-    '',
-    `TASK: ${taskId}\n${taskContent}`,
-    '',
-    `RECENT REPORTS:\n${latestReports || '[No reports yet]'}`,
-    '',
-    'INSTRUCTION:\nComplete the task and return a report using project template.',
-  ].filter(Boolean).join('\n');
-
-  return { rawPrompt, sanitizedPrompt: sanitizePrompt(rawPrompt) };
-}
-
-function defaultMockAiResponse(): string {
-  return `## WORK DONE
-- ✅ Implemented requested changes
-- ✅ Updated related docs
-
-## FILES CHANGED
-- coordination/tasks/TASK-001.md
-
-## TESTS
-PASS mock-tests
-
-## RESULT
-Task completed in mock mode.
-
-## NEXT STEPS
-- [ ] Validate on staging
-`;
-}
-
-async function callOpenAI(prompt: string, model: string): Promise<string> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY is not set');
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'Return a markdown report with sections: WORK DONE, FILES CHANGED, TESTS, RESULT, NEXT STEPS.',
-        },
-        { role: 'user', content: prompt },
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`OpenAI request failed (${response.status}): ${text}`);
-  }
-
-  const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error('OpenAI response does not contain message content');
-
-  return content;
-}
-
-async function callAnthropic(prompt: string, model: string): Promise<string> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY is not set');
-
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      model,
-      max_tokens: 3000,
-      messages: [{ role: 'user', content: prompt }],
-      system: 'Return a markdown report with sections: WORK DONE, FILES CHANGED, TESTS, RESULT, NEXT STEPS.',
-    }),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Anthropic request failed (${response.status}): ${text}`);
-  }
-
-  const data = await response.json() as { content?: Array<{ type?: string; text?: string }> };
-  const content = (data.content ?? [])
-    .filter((part) => part.type === 'text' && typeof part.text === 'string')
-    .map((part) => part.text as string)
-    .join('\n');
-
-  if (!content) throw new Error('Anthropic response does not contain text content');
-  return content;
-}
-
-async function callClaudeCode(prompt: string): Promise<string> {
-  // Claude Code blocks nested sessions (CLAUDECODE env var is set when running inside Claude Code)
-  if (process.env.CLAUDECODE) {
-    throw new Error(
-      'Cannot call Claude Code from within a Claude Code session.\n' +
-      'Run brothers commands from a regular terminal (outside Claude Code).',
-    );
-  }
-
-  const { spawnSync } = await import('node:child_process');
-  const result = spawnSync('claude', ['--print'], {
-    input: prompt,
-    encoding: 'utf-8',
-    timeout: 120000,
-    maxBuffer: 10 * 1024 * 1024,
-  });
-
-  if (result.error) {
-    const err = result.error as NodeJS.ErrnoException;
-    if (err.code === 'ENOENT') {
-      throw new Error(
-        'claude command not found. Make sure Claude Code is installed and in PATH.\n' +
-        'Install: https://claude.ai/code',
-      );
-    }
-    throw new Error(`Claude Code error: ${err.message}`);
-  }
-
-  if (result.status !== 0) {
-    const errMsg = (result.stderr as string) || `exit code ${result.status}`;
-    throw new Error(`Claude Code failed: ${errMsg.trim()}`);
-  }
-
-  const output = (result.stdout as string) || '';
-  // Strip ANSI escape codes for clean report parsing
-  return output.replace(/\x1b\[[0-9;]*m/g, '').trim();
-}
-
-async function callAiProvider(provider: string, prompt: string, model: string | undefined, attempt: number): Promise<string> {
-  const normalized = provider.toLowerCase();
-
-  if (normalized === 'mock') {
-    const failCount = Number(process.env.BROTHERS_MOCK_FAILS || '0');
-    if (attempt <= failCount) {
-      throw new Error(`Mock provider forced failure on attempt ${attempt}/${failCount}`);
-    }
-    return process.env.BROTHERS_MOCK_AI_RESPONSE || defaultMockAiResponse();
-  }
-
-  if (normalized === 'openai') return callOpenAI(prompt, model || 'gpt-4.1-mini');
-  if (normalized === 'anthropic' || normalized === 'claude') return callAnthropic(prompt, model || 'claude-3-5-sonnet-latest');
-  if (normalized === 'claude-code') return callClaudeCode(prompt);
-
-  throw new Error(`Unsupported AI provider for --auto: ${provider}. Use one of: mock, openai, anthropic, claude-code`);
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function callAiWithRetry(
-  provider: string,
-  prompt: string,
-  model: string | undefined,
-  retries: number,
-  retryDelayMs: number,
-): Promise<string> {
-  let lastError: unknown;
-  const maxAttempts = Math.max(1, retries + 1);
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await callAiProvider(provider, prompt, model, attempt);
-    } catch (error) {
-      lastError = error;
-      if (attempt >= maxAttempts) break;
-
-      console.log(`AI attempt ${attempt} failed: ${(error as Error).message}`);
-      const delay = retryDelayMs * attempt;
-      console.log(`Retrying in ${delay}ms...`);
-      await sleep(delay);
-    }
-  }
-
-  throw new Error(`AI provider failed after ${maxAttempts} attempts: ${(lastError as Error).message}`);
-}
-
-function parseAiResponse(raw: string): ParsedAiReport {
-  const statusText = extractAnySection(raw, ['STATUS', 'СТАТУС']).split('\n')[0]?.trim();
-  const status = normalizeTaskStatus(statusText);
-
-  const workSection = extractAnySection(raw, ['WORK DONE', 'ВЫПОЛНЕННЫЕ РАБОТЫ']);
-  const filesSection = extractAnySection(raw, ['FILES CHANGED', 'ИЗМЕНЁННЫЕ ФАЙЛЫ']);
-  const testsSection = extractAnySection(raw, ['TESTS', 'ТЕСТЫ']);
-  const resultSection = extractAnySection(raw, ['RESULT', 'РЕЗУЛЬТАТ']);
-  const nextStepsSection = extractAnySection(raw, ['NEXT STEPS', 'СЛЕДУЮЩИЕ ШАГИ']);
-
-  const doneItems = parseChecklistItems(workSection);
-  const changedFiles = parseChecklistItems(filesSection)
-    .map((item) => item.replace(/^`|`$/g, '').trim())
-    .filter((item) => /[\/]|\.[a-zA-Z0-9]+$/.test(item));
-  const nextSteps = parseChecklistItems(nextStepsSection);
-
-  const testsOutput = testsSection || 'No test output provided by AI response';
-  const resultSummary = resultSection || 'Auto-generated report from AI response.';
-
-  return {
-    status,
-    doneItems: doneItems.length > 0 ? doneItems : ['Implemented task according to AI response'],
-    changedFiles: Array.from(new Set(changedFiles)),
-    testsOutput,
-    nextSteps,
-    resultSummary,
-  };
-}
+const VERSION = '0.8.0';
 
 program
   .name('brothers')
@@ -1253,7 +58,7 @@ program
   .argument('[projectName]', 'Optional directory name for initialization')
   .action((projectName?: string) => {
     const root = projectName ? path.resolve(process.cwd(), projectName) : process.cwd();
-    ensureDir(root);
+    fs.mkdirSync(root, { recursive: true });
 
     if (fs.existsSync(path.join(root, '.brothers-config.json'))) {
       throw new Error(`Project already initialized: ${root}`);
@@ -1264,6 +69,7 @@ program
 
     console.log(`Initialized Brothers Protocol project at: ${root}`);
     console.log('Created: coordination/tasks, coordination/reports, coordination/templates, coordination/batons, .brothers-config.json');
+    console.log('Baton signing secret: .brothers-secret (added to .gitignore, do not commit)');
   });
 
 const ai = program.command('ai').description('Configure AI provider defaults');
@@ -1489,12 +295,34 @@ program
   .argument('<taskId>', 'Task id, e.g. TASK-002')
   .option('--strict', 'Treat warnings as validation errors', false)
   .option('--json', 'Output JSON only', false)
-  .action((taskId: string, options: { strict: boolean; json: boolean }) => {
+  .option('--run-tests', 'Run the project test command; test result is recorded in the baton', false)
+  .option('--test-command <cmd>', 'Override test command for --run-tests (default: config test_command)')
+  .action((taskId: string, options: { strict: boolean; json: boolean; runTests: boolean; testCommand?: string }) => {
     const root = findProjectRoot(process.cwd());
     const config = loadConfig(root);
 
     const validation = validateRelayCheck(root, config, taskId);
-    const strictFailed = options.strict && validation.warnings.length > 0;
+    let warnings = validation.warnings;
+
+    let testRun: BatonTestRun | undefined;
+    if (options.runTests) {
+      const command = options.testCommand || config.test_command;
+      if (!command) {
+        throw new Error(
+          'No test command configured. Set "test_command" in .brothers-config.json ' +
+          'or pass --test-command "npm test"',
+        );
+      }
+      testRun = runTestCommand(root, command);
+      if (testRun.exitCode !== 0) {
+        const details = testRun.outputTail ? `\n--- output tail ---\n${testRun.outputTail}` : '';
+        throw new Error(`Relay validation failed: tests failed (exit ${testRun.exitCode}) for command: ${command}${details}`);
+      }
+      // Реальный успешный прогон тестов сильнее, чем «в отчёте написано not run»
+      warnings = warnings.filter((warning) => !/tests were not executed/.test(warning));
+    }
+
+    const strictFailed = options.strict && warnings.length > 0;
 
     if (options.json) {
       if (strictFailed) {
@@ -1502,35 +330,39 @@ program
           passed: false,
           strict: options.strict,
           taskId,
-          warnings: validation.warnings,
+          warnings,
         }, null, 2));
         process.exitCode = 1;
         return;
       }
 
-      const issued = issueRelayBaton(root, config, taskId, validation.validatedDeps);
+      const issued = issueRelayBaton(root, config, taskId, validation.validatedDeps, testRun);
       console.log(JSON.stringify({
         passed: true,
         strict: options.strict,
         taskId,
         batonId: issued.baton.id,
         batonPath: issued.batonPath,
-        warnings: validation.warnings,
+        testsPassed: testRun ? testRun.exitCode === 0 : undefined,
+        warnings,
       }, null, 2));
       return;
     }
 
     if (strictFailed) {
-      throw new Error(`Relay strict mode failed:\n- ${validation.warnings.join('\n- ')}`);
+      throw new Error(`Relay strict mode failed:\n- ${warnings.join('\n- ')}`);
     }
 
-    const issued = issueRelayBaton(root, config, taskId, validation.validatedDeps);
+    const issued = issueRelayBaton(root, config, taskId, validation.validatedDeps, testRun);
     console.log(`Relay validation passed for ${taskId}`);
+    if (testRun) {
+      console.log(`Tests passed: ${testRun.command} (exit 0, ${testRun.durationMs}ms)`);
+    }
     console.log(`Baton: ${issued.baton.id}`);
     console.log(`Baton file: ${issued.batonPath}`);
-    if (validation.warnings.length > 0) {
+    if (warnings.length > 0) {
       console.log('Warnings:');
-      validation.warnings.forEach((warning) => console.log(`- ${warning}`));
+      warnings.forEach((warning) => console.log(`- ${warning}`));
     }
   });
 
@@ -1545,9 +377,10 @@ program
     const coordination = coordinationRoot(root, config);
 
     const baton = loadBaton(coordination, batonId);
+    const signatureStatus = checkBatonSignature(baton, loadOrCreateSecret(root));
 
     if (options.json) {
-      console.log(JSON.stringify(baton, null, 2));
+      console.log(JSON.stringify({ ...baton, signatureStatus }, null, 2));
       return;
     }
 
@@ -1557,6 +390,11 @@ program
     console.log(`Expires:  ${baton.expiresAt ?? 'n/a'}${expired ? ' ⚠ EXPIRED' : ''}`);
     console.log(`To task:  ${baton.toTask}`);
     console.log(`Passed:   ${baton.passed ? 'yes' : 'no'}`);
+    console.log(`Signature: ${signatureStatus}${signatureStatus !== 'valid' ? ' ⚠' : ''}`);
+    if (baton.testRun) {
+      const outcome = baton.testRun.exitCode === 0 ? 'passed' : `failed (exit ${baton.testRun.exitCode})`;
+      console.log(`Tests:    ${outcome} — ${baton.testRun.command} @ ${baton.testRun.ranAt}`);
+    }
     console.log('Dependencies:');
     for (const dep of baton.dependencies) {
       console.log(`- ${dep.taskId} via ${dep.reportId}`);
@@ -1637,7 +475,7 @@ program
           `Run: brothers relay-check ${taskId} and start with --with-baton BATON-XXX`,
         );
       }
-      verifyBatonForTask(coordination, taskId, dependencies, options.withBaton);
+      verifyBatonForTask(root, coordination, taskId, dependencies, options.withBaton);
     }
 
     if (options.dryRun && options.auto) {
@@ -1841,7 +679,6 @@ program
     }
   });
 
-// ─── STACK (detect and save tech stack) ────────────────────────────────────────
 program
   .command('stack')
   .description('Detect project tech stack and update .brothers-config.json')
@@ -1877,7 +714,6 @@ program
     if (detected.mcp.length)   console.log(`  MCP:   ${detected.mcp.join('\n         ')}`);
   });
 
-// ─── CONTEXT (generate AI prompt without baton check) ──────────────────────────
 program
   .command('context')
   .description('Generate AI context prompt for a task without changing its status')
@@ -1908,7 +744,6 @@ program
     console.log(`Prompt file: ${promptPath}`);
   });
 
-// ─── UI (TUI dashboard) ────────────────────────────────────────────────────────
 program
   .command('ui')
   .description('Launch interactive TUI dashboard')
