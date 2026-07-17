@@ -1,0 +1,117 @@
+CONTEXT: Working with Brothers Protocol
+STACK: nodejs, react, typescript, ink-tui
+RULES:
+# AI Rules
+
+Add project-level AI execution rules here.
+
+CONVENTIONS:
+[No CONVENTIONS.md found]
+TASK: TASK-002
+# TASK-002: Релиз v0.8.1: bump версии + CHANGELOG
+
+## Description
+Релиз v0.8.1: bump версии + CHANGELOG
+
+## Created
+2026-07-17 22:51:27
+
+## Assignee
+auto
+
+## Priority
+medium
+
+## Details
+Поднять версию в package.json и cli.ts, завести CHANGELOG.md с 0.8.0 и 0.8.1
+
+## Dependencies
+- TASK-001
+
+## Done Criteria
+- [ ] Code works
+- [ ] Tests pass
+- [ ] Documentation updated
+
+## Files
+None
+
+---
+*Status: CREATED*
+*Next: Run brothers start TASK-002*
+
+RECENT REPORTS:
+
+---
+File: REPORT-001.md
+# REPORT-001: TUI: показывать статус подписи батона и результат testRun
+
+## DATE
+2026-07-17 22:52:57
+
+## EXECUTOR
+claude
+
+## STATUS
+COMPLETED
+
+## TASK
+TASK-001
+
+## WORK DONE
+- ✅ TUI: подпись и testRun в TaskDetail
+
+## FILES CHANGED
+- src/tui/lib.ts
+- src/tui/screens/TaskDetale.tsx
+
+## TESTS
+```text
+npm test 13/13
+```
+
+## RESULT
+Task TASK-001 completed and documented.
+
+## NEXT STEPS
+- [ ] Релиз v0.8.1
+
+
+---
+File: REPORT-002.md
+# REPORT-002: TUI: показывать статус подписи батона и результат testRun
+
+## DATE
+2026-07-17 22:53:08
+
+## EXECUTOR
+claude
+
+## STATUS
+COMPLETED
+
+## TASK
+TASK-001
+
+## WORK DONE
+- ✅ TUI: статус подписи батона (valid/invalid/missing/no-secret) в TaskDetail
+- ✅ testRun батона с exit code и командой
+- ✅ тип Baton расширен
+
+## FILES CHANGED
+- src/tui/lib.ts
+- src/tui/screens/TaskDetail.tsx
+
+## TESTS
+```text
+npm test: 13/13 pass
+```
+
+## RESULT
+Task TASK-001 completed and documented.
+
+## NEXT STEPS
+- [ ] Релиз v0.8.1: bump версии + CHANGELOG
+
+INSTRUCTION:
+Complete the task and return a report using project template.

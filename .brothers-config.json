@@ -1,0 +1,27 @@
+{
+  "project": "brothers-protocol-cli-mvp",
+  "version": "1.0.0",
+  "ai_provider": "manual",
+  "ai_model": "",
+  "auto_sanitize_prompt": true,
+  "ai_retries": 2,
+  "ai_retry_delay_ms": 800,
+  "coordination_dir": "./coordination",
+  "auto_commit": false,
+  "task_prefix": "TASK",
+  "report_prefix": "REPORT",
+  "conventions_file": "./CONVENTIONS.md",
+  "rules_file": "./AI_RULES.md",
+  "baton_ttl_hours": 72,
+  "test_command": "npm test",
+  "stack": [
+    "nodejs",
+    "react",
+    "typescript",
+    "ink-tui"
+  ],
+  "mcp_suggested": [
+    "@modelcontextprotocol/server-filesystem",
+    "@modelcontextprotocol/server-github"
+  ]
+}

@@ -45,7 +45,7 @@ import { setupProject } from './core/init.js';
 import { callAiWithRetry, callClaudeCode } from './providers.js';
 
 const program = new Command();
-const VERSION = '0.8.0';
+const VERSION = '0.8.1';
 
 program
   .name('brothers')

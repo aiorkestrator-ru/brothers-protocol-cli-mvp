@@ -1,10 +1,10 @@
 # Brothers Protocol CLI
 
-> **v0.8.0** · Markdown-first CLI for safe task handoff between AI agents
+> **v0.8.1** · Markdown-first CLI for safe task handoff between AI agents
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-violet.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-green)](https://nodejs.org/)
-[![Tests](https://img.shields.io/badge/tests-12%2F12%20pass-brightgreen)](#testing)
+[![Tests](https://img.shields.io/badge/tests-13%2F13%20pass-brightgreen)](#testing)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)](https://www.typescriptlang.org/)
 
 ---

@@ -137,3 +137,11 @@ test('relay-check --run-tests without configured command explains how to fix', (
   const out = runFail(['relay-check', 'TASK-002', '--run-tests'], tempRoot);
   assert.match(out, /No test command configured/i);
 });
+
+test('init in a directory with existing README does not overwrite it', () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'brothers-readme-'));
+  fs.writeFileSync(path.join(tempRoot, 'README.md'), '# My real project\n');
+  run(['init'], tempRoot);
+  const readme = fs.readFileSync(path.join(tempRoot, 'README.md'), 'utf-8');
+  assert.match(readme, /My real project/, 'existing README must survive init');
+});

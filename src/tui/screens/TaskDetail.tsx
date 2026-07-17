@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { Badge } from '../components/Badge.js';
 import { StatusBar } from '../components/StatusBar.js';
 import type { Task, Baton } from '../lib.js';
-import { isBatonActive, isBatonExpired } from '../lib.js';
+import { batonSignatureStatus, isBatonActive, isBatonExpired } from '../lib.js';
 
 // dist/tui/screens/TaskDetail.js → dist/tui/ → dist/
 const _distDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -148,10 +148,21 @@ export function TaskDetail({ task, batons, coordDir, onBack, onOutput }: Props) 
         )}
 
         {activeBaton && (
-          <Box marginTop={1} gap={1}>
-            <Text color="green">⚡ Baton {activeBaton.id} активен</Text>
-            {activeBaton.expiresAt && (
-              <Text color="gray">(истекает {activeBaton.expiresAt})</Text>
+          <Box marginTop={1} flexDirection="column">
+            <Box gap={1}>
+              <Text color="green">⚡ Baton {activeBaton.id} активен</Text>
+              {activeBaton.expiresAt && (
+                <Text color="gray">(истекает {activeBaton.expiresAt})</Text>
+              )}
+              <BatonSignature baton={activeBaton} coordDir={coordDir} />
+            </Box>
+            {activeBaton.testRun && (
+              <Box>
+                <Text color={activeBaton.testRun.exitCode === 0 ? 'green' : 'red'}>
+                  {activeBaton.testRun.exitCode === 0 ? '  ✓ тесты прошли' : `  ✗ тесты упали (exit ${activeBaton.testRun.exitCode})`}
+                </Text>
+                <Text color="gray"> — {activeBaton.testRun.command} @ {activeBaton.testRun.ranAt}</Text>
+              </Box>
             )}
           </Box>
         )}
@@ -186,6 +197,14 @@ export function TaskDetail({ task, batons, coordDir, onBack, onOutput }: Props) 
       ]} />
     </Box>
   );
+}
+
+function BatonSignature({ baton, coordDir }: { baton: Baton; coordDir: string }) {
+  const status = batonSignatureStatus(coordDir, baton);
+  if (status === 'valid')     return <Text color="green">✓ подписан</Text>;
+  if (status === 'invalid')   return <Text color="red" bold>✗ ПОДПИСЬ НЕВАЛИДНА</Text>;
+  if (status === 'missing')   return <Text color="yellow">⚠ без подписи</Text>;
+  return <Text color="gray" dimColor>подпись не проверить (нет секрета)</Text>;
 }
 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {

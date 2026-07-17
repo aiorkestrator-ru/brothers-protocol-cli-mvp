@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { checkBatonSignature, type RelayBaton } from '../core/relay.js';
 
 export type TaskStatus = 'CREATED' | 'IN_PROGRESS' | 'COMPLETED' | 'BLOCKED';
 
@@ -13,12 +14,20 @@ export interface Task {
   files: string[];
 }
 
+export interface BatonTestRunView {
+  command: string;
+  exitCode: number;
+  ranAt: string;
+}
+
 export interface Baton {
   id: string;
   toTask: string;
   passed: boolean;
   expiresAt?: string;
   createdAt: string;
+  signature?: string;
+  testRun?: BatonTestRunView;
 }
 
 export function findCoordDir(startDir: string = process.cwd()): string | null {
@@ -116,6 +125,16 @@ export function getProjectStack(coordDir: string): string[] {
 
 export function getMcpSuggested(coordDir: string): string[] {
   return readConfig(coordDir).mcp_suggested ?? [];
+}
+
+export type BatonSignatureView = 'valid' | 'invalid' | 'missing' | 'no-secret';
+
+/** Статус подписи батона для TUI: no-secret = секрет проекта недоступен, проверить нельзя. */
+export function batonSignatureStatus(coordDir: string, baton: Baton): BatonSignatureView {
+  const secretPath = path.join(path.dirname(coordDir), '.brothers-secret');
+  if (!fs.existsSync(secretPath)) return 'no-secret';
+  const secret = fs.readFileSync(secretPath, 'utf-8').trim();
+  return checkBatonSignature(baton as unknown as RelayBaton, secret);
 }
 
 export function isBatonActive(baton: Baton): boolean {

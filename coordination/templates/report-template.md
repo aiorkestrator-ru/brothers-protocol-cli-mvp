@@ -1,0 +1,28 @@
+# REPORT-{ID}: {TASK_TITLE}
+
+## DATE
+{DATE}
+
+## EXECUTOR
+{EXECUTOR}
+
+## STATUS
+{STATUS}
+
+## TASK
+{TASK_ID}
+
+## WORK DONE
+- ✅ {ITEM_1}
+
+## FILES CHANGED
+- {FILE_1}
+
+## TESTS
+{TEST_OUTPUT}
+
+## RESULT
+{RESULT}
+
+## NEXT STEPS
+- [ ] {NEXT_STEP_1}

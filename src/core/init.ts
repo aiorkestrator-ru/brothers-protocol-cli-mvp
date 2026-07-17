@@ -96,9 +96,11 @@ export function setupProject(root: string, projectName: string): void {
 `,
   );
 
-  writeText(
-    path.join(root, 'README.md'),
-    `# ${projectName}
+  // README пишем только если его нет: init в существующем проекте не должен затирать чужой README
+  if (!fs.existsSync(path.join(root, 'README.md'))) {
+    writeText(
+      path.join(root, 'README.md'),
+      `# ${projectName}
 
 MVP implementation for Brothers Protocol CLI.
 
@@ -114,7 +116,8 @@ node dist/cli.js report TASK-001 --done "Implemented flow" --tests "npm test"
 node dist/cli.js status
 \`\`\`
 `,
-  );
+    );
+  }
 
   if (!fs.existsSync(path.join(root, 'AI_RULES.md'))) {
     writeText(path.join(root, 'AI_RULES.md'), '# AI Rules\n\nAdd project-level AI execution rules here.\n');
