@@ -74,7 +74,7 @@ Auto report created: REPORT-002
 GitHub repository:
 
 ```text
-https://github.com/avtogost77-gif/brothers-protocol-cli-mvp
+https://github.com/aiorkestrator-ru/brothers-protocol-cli-mvp
 Visibility: PRIVATE
 ```
 

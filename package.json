@@ -23,7 +23,7 @@
     "handoff",
     "llm"
   ],
-  "author": "avtogost77-gif",
+  "author": "aiorkestrator-ru",
   "license": "MIT",
   "description": "Markdown-first CLI for safe task handoff between AI agents — Relay Baton protocol",
   "private": false,

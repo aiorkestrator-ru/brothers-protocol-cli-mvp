@@ -44,7 +44,7 @@ The baton checks:
 
 ```bash
 # Install
-git clone https://github.com/avtogost77-gif/brothers-protocol-cli-mvp
+git clone https://github.com/aiorkestrator-ru/brothers-protocol-cli-mvp
 cd brothers-protocol-cli-mvp
 npm install && npm run build
 

@@ -16,7 +16,7 @@ Direct PAT push (one-shot, no password prompt):
 
 ```bash
 export GITHUB_TOKEN="<your_pat>"
-git push "https://x-access-token:${GITHUB_TOKEN}@github.com/avtogost77-gif/brothers-protocol-cli-mvp.git" main
+git push "https://x-access-token:${GITHUB_TOKEN}@github.com/aiorkestrator-ru/brothers-protocol-cli-mvp.git" main
 ```
 
 ## Local Usage
